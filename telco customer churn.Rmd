@@ -1,0 +1,936 @@
+---
+title: "Predicción de fuga de clientes en TELCO"
+author: "Javier Pérez, Marina Kurmanova y Lorena Rodriguez"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    number_sections: true 
+    code_folding: show 
+---
+
+
+```{r knitr_init, cache=FALSE, include=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=FALSE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE, 
+               plain.ascii = FALSE)
+opts_knit$set(width=75)
+```
+
+# Descripción del problema  
+
+Nuestra tarea en esta practica será predecir si un usuario se dará de baja en una empresa de telecomunicaciones. 
+El conjunto de datos está sacado de una competición de [**Kaggle**](https://www.kaggle.com/blastchar/telco-customer-churn).
+
+Se disponen de 7044 observaciones y 21 variables estructuradas de la siguiente manera:
+
+- **Churn** : Clientes que se fueron en el último mes (variable a predecir)
+
+- **Servicios en los que cada cliente se ha registrado**: teléfono, varias líneas, Internet, seguridad en línea, respaldo en línea, protección de dispositivos, soporte técnico y transmisión de TV y películas.
+
+- **Información de la cuenta del cliente**: permanencia del cliente, contrato, método de pago, facturación electrónica, cargos mensuales y cargos totales
+
+- **Información demográfica sobre los clientes**: género, rango de edad, y si tienen socios y dependientes
+
+
+# Métrica de evaluación de nuestro problema (AUC)
+
+La curva ROC es una medida de rendimiento para problemas de clasificación en función a varios umbrales. ROC es una curva de probabilidad y AUC representa el area bajo esa curva. Indica cuánto es capaz el modelo de distinguir entre clases. Cuanto más alto es el AUC, mejor es el modelo.
+
+La curva ROC enfrenta 1- Specificity (FPR) frente a Sensitivity(TPR) para distintos puntos de corte.
+
+![Curva AUC](Curva_AUC_1.png)
+
+![Sensitivity](Sensitivity.png)
+
+![1-Specificity](FPR.png)
+
+# Desarrollo de la práctica 
+
+## Carga de librerías y datos 
+
+```{r}
+library(tidyverse)
+library(summarytools)
+library(caret)
+library(corrplot)
+library(glmnet)
+library(ISLR)
+library(class)
+library(dplyr)
+library(ROCR)
+library(pROC)
+library(factoextra)
+library(cluster)
+
+
+df <- read_csv("WA_Fn-UseC_-Telco-Customer-Churn.csv")
+```
+
+## EDA
+
+En este apartado trataremos de analizar las distintas variables que tenemos en nuestro dataset y encontrar distintos patrones que nos ayuden a modelizar en apartados posteriores.
+
+Empezaremos visualizando un esquema de las distintas variables que tenemos en nuestro dataset:
+
+```{r}
+dfSummary(df, style = 'multiline', graph.magnif = 0.75, tmp.img.dir = "/tmp")
+```
+
+
+### Transformación de datos 
+
+En primer lugar transformamos nuestras variables categóricas en factores y aquellas que tengan dos únicos niveles la transformamos en una variable binaria. 
+Además, eliminamos la variable que identifica a cada cliente, ya que no nos sirve para modelizar.
+
+```{r echo=TRUE}
+df <- df %>% mutate_if(is.character,as.factor)
+df <- df %>% mutate(gender = ifelse(gender == "Male", 1, 0))
+df <- df %>% mutate(Churn = ifelse(Churn == "Yes", 1,0))
+df <- df %>% mutate(Partner = ifelse(Partner == "Yes", 1, 0))
+df <- df %>% mutate(Dependents = ifelse(Dependents == "Yes", 1, 0))
+df <- df %>% mutate(PhoneService = ifelse(PhoneService == "Yes", 1, 0))
+df <- df %>% mutate(PaperlessBilling = ifelse(PaperlessBilling == "Yes", 1, 0))
+df_backup_tenure <- df$tenure
+df <- df %>% mutate(tenure = factor(cut(df$tenure, breaks = 6, labels = FALSE, ordered_result = TRUE)))
+
+
+
+# variables que no se meten en la modelizacion 
+vars_drop <- c("customerID")
+df <- df %>% select(-vars_drop)
+```
+
+### Estudio de variables 
+
+En este apartado recogeremos particularidades importantes que hemos podido observar de algunas variables.
+
+- Variable `Churn`
+
+Vemos en primer lugar la tasa de fuga para nuestro problema:
+
+```{r}
+mean(df$Churn)
+```
+
+Tenemos un `r mean(df$Churn)*100`% de fuga de clientes. Nuestra muestra no está del todo balanceada al 50%, pero tampoco es una tasa muy pequeña.
+
+- Variable `TotalCharges`
+
+```{r echo=TRUE}
+
+df %>% ggplot(aes(x = TotalCharges)) +
+  geom_histogram(alpha=0.5, fill = "brown4")
+
+```
+
+Como podemos apreciar, dicha variable tiene una cola grande a la derecha, por lo que estaría bien aplicarle la transformación logarítmica.
+
+```{r echo=TRUE}
+df %>% ggplot(aes(x = log(TotalCharges))) +
+  geom_density(alpha=0.5, fill = "brown4")
+```
+
+Reflejamos ahora la distribución de dicha variable discriminando por Fuga/No-Fuga:
+
+```{r}
+df %>% ggplot(aes(x = log(TotalCharges), group = as.factor(Churn), fill = as.factor(Churn))) +
+  geom_density(alpha=0.5)
+```
+
+Apreciamos una distribución distinta para ambos grupos, lo que nos indica que a simple vista debería discriminar bien en nuestros modelos.
+
+- Variables `InternetService`, `OnlineSecurity` y `TechSupport`
+
+Nos calculamos la tasa de fuga por cada categoría que toman dichas variables: 
+
+```{r echo=TRUE}
+df %>% group_by(InternetService) %>% summarise(tasa_fuga = mean(Churn))
+df %>% group_by(OnlineSecurity) %>% summarise(tasa_fuga = mean(Churn))
+df %>% group_by(TechSupport) %>% summarise(tasa_fuga = mean(Churn))
+```
+
+Apreciamos una tasa bastante distinta entre los usuarios que tienen internet (0.0741) frente a los que no tienen internet. Estaría bien lanzar dos modelos diferentes discriminando entre los clientes que tienen internet frente a los que no. 
+Además, apreciamos que en las 3 variables tenemos una tasa de fuga igual a 0.0741 en una de sus categorias, por lo que, dichas variables estarán correlacionadas.
+
+- Variable `tenure`
+
+Reflejamos la densidad de esta variable discriminando por Fuga/No-Fuga
+
+```{r}
+df %>% ggplot(aes(x = tenure, group = as.factor(Churn), fill = as.factor(Churn))) +
+  geom_density(alpha=0.5)
+```
+
+Aprenciamos dos distribuciones distintas para ambos grupos. Por lo que, a simple vista, dicha variable debería discriminar bien en nuestros modelos.
+
+## División en train y test 
+
+Dividimos nuestro conjunto de datos en Train y Test. El conjunto de datos de Train servirá para entrenar nuestros modelos y el conjunto de datos Test para dar una métrica final a nuestros modelos y poder decantarnos entre uno de ellos.
+
+```{r echo=TRUE}
+set.seed(1234)
+inTraining <- createDataPartition(df$Churn,
+                                  p = 0.75, list = FALSE, times = 1)
+df_training <- slice(df, inTraining)
+df_testing <- slice(df, -inTraining)
+```
+
+## Tratamiento de datos 
+
+### Tratamiento Train
+
+En este apartado se han imputado los valores missings de la variable `TotalCharges`por la media de la variable, se le ha aplicado el logaritmo, se ha creado las variables missings y se han eliminado las variables con una correlación mayor que un 90%
+
+
+```{r echo=TRUE}
+# imputacion de NA's de la variable TotalCharges
+mean_var <- mean(df_training$TotalCharges, na.rm = T)
+df_train <- df_training %>% mutate(TotalCharges = ifelse(is.na(TotalCharges), mean_var, TotalCharges))
+
+# transformacion de TotalCharges usando el logaritmo.
+df_train <- df_train %>% mutate(log_TotalCharges = log(df_train$TotalCharges))
+df_train <- df_train %>% select(-TotalCharges)
+
+# variables dummies 
+dummy <- dummyVars(~ ., data = df_train, fullRank = TRUE)
+df_train <- predict(dummy, df_train)
+
+# variables correladas 
+M<-cor(df_train)
+corrplot(M, diag = FALSE, order = "FPC",
+         tl.pos = "td", tl.cex = 0.5, method = "color", type = "upper")
+
+# eliminamos variables con una correlacion mayor del 90%
+M[upper.tri(M)] <- 0
+diag(M) <- 0
+M[!lower.tri(M)] <- 0
+
+df_train <- as.data.frame(df_train[,!apply(M,2,function(x) any(abs(x) > 0.9))])
+
+M<-cor(df_train)
+
+corrplot(M, diag = FALSE, order = "FPC",
+         tl.pos = "td", tl.cex = 0.5, method = "color", type = "upper")
+
+# cambiamos el nombre de las variables para que no nos aparezcan espacios en blanco
+colnames(df_train) <- gsub(" ", "", colnames(df_train), fixed = TRUE)%>% str_replace("\\(.*\\)", "")
+```
+
+### Tratamiento test 
+
+Realizamos al conjunto de datos de Test el mismo tratamiento que le hemos realizado al conjunto de datos de entrenamiento.
+
+```{r echo=TRUE}
+# imputacion de NA's de la variable TotalCharges
+df_test <- df_testing %>% mutate(TotalCharges = ifelse(is.na(TotalCharges), mean_var, TotalCharges))
+
+# transformacion de TotalCharges usando el logaritmo.
+df_test <- df_test %>% mutate(log_TotalCharges = log(df_test$TotalCharges))
+df_test <- df_test %>% select(-TotalCharges)
+
+# variables dummies 
+df_test <- predict(dummy, df_test)
+
+# cambiamos el nombre de las variables
+colnames(df_test) <- gsub(" ", "", colnames(df_test), fixed = TRUE) %>% str_replace("\\(.*\\)", "")
+
+# variables correladas 
+
+# eliminamos las mismas variables correladas que en train 
+df_test <- as.data.frame(df_test[,names(df_train)])
+```
+
+## Estrategias de modelización 
+
+En este apartado se describirán las distintas estrategias de modelización que se han llevado a cabo.
+Cada una de las estrategias serán comparadas con la métrica AUC.
+
+### Estrategia 1: GLM
+
+En esta estrategia lanzaremos un modelo de regresión logística con todos los datos sin discriminar por ningún grupo.
+Aplicaremos LASSO como método de selección de variables.
+
+- **Regresión lineal**
+
+```{r echo=TRUE}
+# Lanzamos GLM 
+logr_vm <- glm(Churn ~ ., family = binomial, data = df_train)
+summary(logr_vm)
+```
+
+- **Selección de variables con LASSO**
+
+Utilizaremos validación cruzada para elegir el parámetro lambda que mejor se ajuste a nuestros datos.
+Elegiremos aquel que se diferencie en una unidad de error estandar con respecto al valor de lambda óptimo (el que maximiza el AUC)
+
+```{r echo=TRUE}
+x_train <- model.matrix(Churn~.,df_train)[,-1]
+y_train <- as.factor(df_train$Churn)
+x_test <- as.matrix(df_test %>% select(-Churn))
+y_test <- as.factor(df_test$Churn)
+cv.out <- cv.glmnet(x_train, y_train, alpha=1, nfolds=5, type.measure="auc", family="binomial")
+plot(cv.out)
+```
+
+- Valor de lamba con el que entrenaremos: 
+
+```{r echo=TRUE}
+cv.out$lambda.1se
+```
+
+- Coeficientes del Lasso:
+
+```{r echo=TRUE}
+tmp_coeffs <- coef(cv.out, s = "lambda.1se")
+
+tmp_coeffs
+```
+
+
+- **Predicción en Test**
+
+```{r echo=TRUE}
+lasso.pred=predict(cv.out, newx = x_test, type="response")
+```
+
+- **Curva ROC y métrica AUC en Test**
+
+```{r}
+roc_glm = roc(df_test$Churn, lasso.pred)
+plot(roc_glm,
+     col="darkblue", lwd=3, main="Curve ROC")
+auc_df = data.frame()
+auc_df["glm","auc"] <- ModelMetrics::auc(y_test, lasso.pred)
+auc_df
+```
+
+- **Matriz de confusión**
+```{r}
+lasso_class=predict(cv.out,newx = x_test, type = "class")
+confusionMatrix(table(lasso_class,df_test$Churn), positive="1")
+```
+
+### Estrategia 2: GLM 2
+
+En esta estrategia lanzaremos un modelo de regresión discriminando por los clientes que tienen internet frente a los que no.
+Para ello nos crearemos una variable binaria `has_internet`que nos servirá para discriminar dos rectas distintas de regresión en nuestro modelo. 
+
+
+Como en la estrategia anterior, aplicaremos LASSO como método de selección de variables.
+
+
+```{r include=FALSE}
+source("src/utils_tratamiento.R") # funcion de tratamiento encapsulada
+df_train <- df_training %>% mutate(has_internet = if_else(InternetService == "No", 0,1))
+df_test <- df_testing %>% mutate(has_internet = if_else(InternetService == "No", 0,1))
+
+tratamiento <- tratamiento_train_test(df_train, df_test) # esta funcion esta definida en utils_tratamiento
+df_train <- tratamiento$df_train 
+df_test <- tratamiento$df_test
+```
+
+
+```{r echo=TRUE}
+x_train <- model.matrix(Churn~.,df_train)[,-1]
+y_train <- as.factor(df_train$Churn)
+x_test <- as.matrix(df_test %>% select(-Churn))
+cv.out <- cv.glmnet(x_train,y_train,alpha=1, nfolds=5, type.measure="auc", family="binomial")
+plot(cv.out)
+```
+
+El valor de lambda que usaremos es el valor que dista una unidad de error estándar del lambda que maximiza el auc.
+```{r echo=TRUE}
+cv.out$lambda.1se # valor de lamba que se utilizará a la hora de predecir (en el predict por defecto está ese valor)
+```
+
+A continuación se muestran los coeficientes del LASSO para el valor de lambda que hemos seleccionado.
+```{r echo=TRUE}
+tmp_coeffs <- coef(cv.out, s = "lambda.1se") # coeficientes del lasso para el valor de lamba que hemos seleccionado
+
+tmp_coeffs
+
+```
+
+
+- **Predicción en Test**
+
+Realizamos validación con los datos del test sobre el modelo de regresión logística binomial que hemos entrenado en el apartado anterior sobre los datos de entrenamiento.
+
+```{r}
+lasso.pred=predict(cv.out,newx = x_test, type="response")
+```
+
+- **Curva ROC y métrica AUC en Test**
+
+Representamos la curva ROC y calculamos la métrica AUC a partir de los resultados de test.
+```{r echo=TRUE}
+roc_glm2 = roc(df_test$Churn, lasso.pred)
+plot(roc_glm2,
+     col="darkblue", lwd=3, main="Curve ROC")
+auc_df["glm2","auc"] <- ModelMetrics::auc(df_test$Churn,lasso.pred)
+auc_df
+```
+
+
+Los resultados obtenidos con esté método son similares al método utilizado en la estrategia anterior.
+
+- **Matriz de confusión**
+```{r}
+lasso_class=predict(cv.out,newx = x_test, type = "class")
+confusionMatrix(table(lasso_class,df_test$Churn), positive="1")
+```
+
+### Estrategia 3: Clustering
+
+En esta estrategia realizaremos clustering k-means con las varibles del Lasso establecidas anteriormente y lanzaremos un modelo de regresión por cada grupo obtenido.
+
+Vamos a estandarizar las variables para mejorar el resultado del clustering.
+
+```{r echo=TRUE}
+# nos quedamos con las variables del Lasso y normalizamos
+important_variables <- names(tmp_coeffs[,1][tmp_coeffs[,1] != 0])
+
+df_train_cluster <- df_train %>% select(setdiff(important_variables, "(Intercept)" ))
+
+scaled.df_train <- scale(df_train_cluster)
+```
+
+Es necesario establecer el número de clusters adecuado para nuestros datos. Para ello, utilizamos la libreria factoextra, que contiene varios métodos para este cometido envueltos en funciones simples.
+
+**Método  del "codo":**
+
+La idea de este método consiste en ejecutar k-means en los datos para un rango k de valores (en nuestro caso de 1 a 10), y para cada valor de k calcular la suma de los errores cuadráticos intra cluster.
+
+```{r echo=TRUE}
+fviz_nbclust(scaled.df_train, kmeans, method = "wss")
+```
+
+Aunque no se observa un resultado claro, parece que un valor entre 3 y 6 clusters podría ser razonable.
+
+**Método de la silueta:**
+
+```{r echo=TRUE}
+fviz_nbclust(scaled.df_train, kmeans, method = "silhouette")
+```
+
+Tal y como indica el método de la silueta, escogemos 4 clusters.
+
+- **Clustering con K-means**
+
+Aplicamos k-means para determinar los 4 grupos:
+
+```{r echo=TRUE}
+clusters <- kmeans(x = scaled.df_train, centers = 4, nstart = 25)
+df_train <- df_train %>% mutate(cluster = as.factor(clusters$cluster))
+```
+
+
+Convertimos la variable "cluster" en dummies de forma que obtenemos 3 nuevas variables indicando cada una la pertenencia o no del dato al cluster en cuestión. Esto nos permitirá lanzar un glm para cada cluster para que después Lasso nos indique cuales de estas nuevas variables son significativas.
+
+```{r echo=TRUE}
+dummy <- dummyVars(~ ., data = df_train, fullRank = TRUE)
+df_train <- as.data.frame(predict(dummy, df_train))
+knitr::kable(head(df_train))
+```
+
+- **Lanzamos LASSO:**
+
+```{r echo=TRUE}
+x_train <- model.matrix(Churn~.,df_train)[,-1]
+y_train <- as.factor(df_train$Churn)
+cv.out <- cv.glmnet(x_train,y_train,alpha=1, nfolds=5, type.measure="auc", family="binomial")
+plot(cv.out)
+cv.out$lambda.1se 
+
+tmp_coeffs <- coef(cv.out, s = "lambda.1se")
+
+tmp_coeffs
+```
+
+Observamos que las variables correspondientes a los clusters 2 y 4 no resultan ser significativas. Esto nos indica que pertenecer o no a dichos grupos no es relevante para nuestra predicción.
+
+
+- **Predicción en Test**
+
+Utilizamos la distancia euclidea para asignar a cada observación de test el cluster al que pertenece.
+
+```{r echo=TRUE}
+df_test_cluster <- df_test %>% select(setdiff(important_variables, "(Intercept)" ))
+scaled.df_test <- scale(df_test_cluster)
+
+cluster_test <- apply(scaled.df_test, 1, function(x){
+  distances <- apply(clusters$centers, 1, function(y){
+    return(dist(rbind(x,y)))
+  })
+  
+  cluster_min <- as.numeric(which.min(distances))
+  return(cluster_min)
+  
+})
+
+df_test <- df_test %>% mutate(cluster = as.character(cluster_test))
+```
+
+
+Hacemos variables dummies y predecimos:
+
+```{r echo=TRUE}
+df_test <- as.data.frame(predict(dummy, df_test))
+x_test <- as.matrix(df_test %>% dplyr::select(-Churn))
+
+lasso.pred=predict(cv.out,newx = x_test, type="response")
+```
+
+
+- **Curva ROC y métrica AUC en Test**
+```{r echo=TRUE}
+roc_clust = roc(df_test$Churn, lasso.pred)
+plot(roc_clust,
+     col="darkblue", lwd=3, main="Curve ROC")
+auc_df["clust","auc"] <- ModelMetrics::auc(df_test$Churn,lasso.pred)
+auc_df
+```
+
+- **Matriz de confusión**
+
+```{r}
+lasso_class=predict(cv.out,newx = x_test, type = "class")
+confusionMatrix(table(lasso_class,df_test$Churn), positive="1")
+```
+
+Se observa que no hemos obtenido una mejora apreciable de hacer clustering, ya que los resultados son muy similares.
+
+
+### Estrategia 4: KNN
+
+Como una cuarta estrategia usaremos el algoritmo de k-Nearest Neighbors. Es un algoritmo de aprendizaje **supervisado** en el cual partimos de un set de observaciones *(x, y)* etiquetadas y queremos capturar la relación entre *x* e *y*.
+
+Originalmente KNN es un algoritmo de clasificación **no paramétrico** y **basado en instancias**. Esto último en particular significa que el algoritmo no aprende o entrena un modelo exactamente. En cambio, memoriza las instancias que le pases y las usa directamente como conocimiento para la fase de predicción. 
+
+En nuestro caso usaremos los datos del set de train para seleccionar un *k* óptimo en base a la métrica seleccionada y el de test para validar el modelo. Por último, compararemos las 4 estrategias usadas en base a la misma métrica para decidir un único modelo.
+
+Seleccionamos variables que ha devuelto el algoritmo de selección de variables Lasso de la Estrategia 2 y dejamos en los dataset de train y de test solamente las variables relevantes que ha seleccionado el modelo.  
+
+```{r include=FALSE}
+df_train <- df_training %>% mutate(has_internet = if_else(InternetService == "No", 0,1))
+df_test <- df_testing %>% mutate(has_internet = if_else(InternetService == "No", 0,1))
+
+tratamiento <- tratamiento_train_test(df_train, df_test)
+
+df_train <- tratamiento$df_train 
+df_test <- tratamiento$df_test
+
+x_train <- model.matrix(Churn~.,df_train)[,-1]
+y_train <- as.factor(df_train$Churn)
+x_test <- as.matrix(df_test %>% select(-Churn))
+cv.out <- cv.glmnet(x_train,y_train,alpha=1, nfolds=5, type.measure="auc", family="binomial")
+plot(cv.out)
+cv.out$lambda.1se
+
+tmp_coeffs <- coef(cv.out, s = "lambda.1se")
+
+```
+
+Seleccionamos solo las variables que ha devuelto el algoritmo de selección LASSO.
+
+```{r echo=TRUE}
+names_cols <- names(tmp_coeffs[,1][tmp_coeffs[,1] != 0])
+names_cols <- c(setdiff(names_cols, "(Intercept)" ), "Churn")
+df_train <- select(df_train, names_cols)
+df_test <- select(df_test, names_cols)
+```
+
+#### Selección de k y entrenamiento de modelo
+
+Vamos a buscar el mejor k para obtener las mejores métricas que definan el modelo. Para ello ejecutaremos
+el modelo varias veces calculando *auc* en cada iteración. El rango de k donde buscamos será entre 1 y 15 y la decisión la tomaremos basándonos en la métrica *auc*. Sin embargo, calcularemos también las métricas de *accuracy*, *precision* y *recall*.
+
+```{r echo=TRUE}
+long = 15
+accuracy = rep(0,long)
+f1score = rep(0,long)
+recall = rep(0,long)
+precision = rep(0,long)
+auc_metric = rep(0,long)
+for (i in 1:long)
+{
+ prediccion_knn_cv =knn.cv(df_train %>% dplyr::select(-Churn),
+                           k=i, cl=df_train$Churn)
+ accuracy[i] = sum(prediccion_knn_cv == df_train$Churn) /nrow(df_train)
+ recall[i] = sum(prediccion_knn_cv == df_train$Churn & df_train$Churn == 1) / sum(df_train$Churn == 1)
+ precision[i] = sum(prediccion_knn_cv == df_train$Churn & prediccion_knn_cv == 1) / sum(prediccion_knn_cv == 1)
+ auc_metric[i] = ModelMetrics::auc(df_train$Churn,prediccion_knn_cv)
+}
+resultados_knn = as.data.frame(cbind(accuracy,f1score,precision,recall,auc_metric))
+resultados_knn = resultados_knn %>% mutate(index=as.factor(seq(1:long)))
+```
+
+
+Al entrenar con nuestros datos de train nos sale un k=14 usando la metrica AUC:
+```{r echo=TRUE}
+optimal_k_auc = which.max(resultados_knn$auc_metric)
+optimal_k_auc
+
+```
+
+
+- **Predicción en test**
+
+A continuación realizamos la predicción usando el valor k = 15 que hemos seleccionado en la fase de *train*. 
+```{r echo=TRUE}
+knn_test = knn(df_train %>% dplyr::select(-Churn), df_test %>% dplyr::select(-Churn), k=optimal_k_auc, cl=df_train$Churn, prob = TRUE)
+```
+
+
+El AUC que obtenemos es el siguiente:
+```{r echo=TRUE}
+roc_knn = roc(df_test$Churn,attr(knn_test, "prob"))
+plot(roc_knn,
+     col="darkblue", lwd=3, main="Curve ROC")
+
+auc_df["knn", "auc"] = ModelMetrics::auc(df_test$Churn, knn_test)
+auc_df
+```
+
+- **Matriz de confusión**
+```{r}
+confusionMatrix(table(knn_test,df_test$Churn), positive="1")
+```
+
+### Estrategia 5: SVM
+
+Otra estrategia que nos queda por probar es Support Vector Machines (SVM). Una SVM construye un hiperplano o conjunto de hiperplanos en un espacio de dimensionalidad muy alta (o incluso infinita) que puede ser utilizado en problemas de clasificación o regresión. Una buena separación entre las clases permitirá una clasificación correcta.
+
+```{r echo=TRUE}
+library(e1071)
+
+model <- svm(y = y_train, x = x_train, kernel = "linear", cost = 10, type = "C-classification", scale = FALSE, probability = TRUE)
+summary(model)
+```
+
+- Predicción en test
+
+```{r echo=TRUE}
+testprediction <- predict(model, x_test, probability = TRUE)
+pred_svm <- attr(testprediction, "prob")[,1]
+```
+
+El AUC que obtenemos es el siguiente:
+
+```{r echo=TRUE}
+roc_svm = roc(df_test$Churn,pred_svm)
+plot(roc_svm,
+     col="darkblue", lwd=3, main="Curve ROC")
+auc_df["svm", "auc"] = ModelMetrics::auc(df_test$Churn, pred_svm)
+auc_df
+
+```
+
+### Estrategia 6: Árboles de decisión
+
+Vamos a entrenar ahora un árbol de decisión
+
+```{r echo=TRUE}
+library(rpart)
+library(rattle)
+
+df_train_factor <- df_train %>% mutate(Churn = as.factor(Churn))
+levels(df_train_factor$Churn) <- c("class_0", "class_1")
+df_test_factor <- df_test %>% mutate(Churn = as.factor(Churn))
+levels(df_test_factor$Churn) <- c("class_0", "class_1")
+
+# TRAIN
+churn.dt = rpart(Churn~., data=df_train_factor, control = rpart.control(cp = 0.001, maxdepth = 10, minbucket = 10))
+
+# Predict
+dt_pred.train=predict(churn.dt, df_train_factor)
+dt_pred.test=predict(churn.dt, df_test_factor, type="prob")[,"class_1"]
+
+roc_dt = roc(df_test_factor$Churn, as.vector(dt_pred.test))
+auc_df["tree", "auc"] = ModelMetrics::auc(df_test_factor$Churn, as.vector(dt_pred.test))
+```
+
+```{r}
+fancyRpartPlot(churn.dt)
+auc_df
+```
+
+El auc obtenido no supone una mejoría con respecto a lo obtenido anteriormente.
+
+```{r}
+confusionMatrix(table(ifelse(dt_pred.test > 0.5, "1", "0"), df_test$Churn), positive="1")
+```
+
+### Estrategia 7: Random Forest
+
+El algoritmo Random Forest tiene una cantidad de metaparámetros a definir. Para elegir la combinación de parámetros optima lanzaremos un Grid Search con validacion cruzada.
+Los parametros que queremos optimizar son el numero de arboles y el número de variabes seleccionadas aleatoriamente de cada arbol.
+Lo implementaremos con la libreria *Caret* y *RandomForest*:
+
+```{r echo=TRUE}
+library(randomForest)
+library(mlbench)
+library(caret)
+
+customRF <- list(type = "Classification",
+                 library = "randomForest",
+                 loop = NULL)
+
+customRF$parameters <- data.frame(parameter = c("mtry", "ntree"),
+                                  class = rep("numeric", 2),
+                                  label = c("mtry", "ntree"))
+
+customRF$grid <- function(x, y, len = NULL, search = "grid") {}
+
+customRF$fit <- function(x, y, wts, param, lev, last, weights, classProbs) {
+  randomForest(x, y,
+               mtry = param$mtry,
+               ntree=param$ntree)
+}
+
+#Predict label
+customRF$predict <- function(modelFit, newdata, preProc = NULL, submodels = NULL)
+   predict(modelFit, newdata)
+
+#Predict prob
+customRF$prob <- function(modelFit, newdata, preProc = NULL, submodels = NULL)
+   predict(modelFit, newdata, type = "prob")
+
+customRF$sort <- function(x) x[order(x[,1]),]
+customRF$levels <- function(x) x$classes
+
+```
+
+
+```{r echo=TRUE}
+control <- trainControl(method="cv", 
+                        number=5, 
+                        allowParallel = TRUE, 
+                        #verboseIter = TRUE, 
+                        classProbs = TRUE)
+
+tunegrid <- expand.grid(.mtry=c(1:10),.ntree=c(100,500))
+
+custom <- caret::train(Churn~., data=df_train_factor, 
+                method=customRF, 
+                metric='ROC', 
+                tuneGrid=tunegrid, 
+                trControl=control)
+
+summary(custom)
+plot(custom)
+
+results <- custom$results
+param_opt <- results[which.max(results$Accuracy), c(1,2)]
+```
+A simple vista, la mejor combinación de parámetros es mtry = `r param_opt[,"mtry"]` y ntree = `r param_opt[,"ntree"]`.
+Volvemos a entrenar nuestro algoritmo de Random Forest con la mejor combinación resultante.
+
+```{r echo=TRUE}
+train_fit <- randomForest(Churn~., data=df_train_factor,
+                          ntree = param_opt[,"ntree"],
+                          mtry = param_opt[,"mtry"])
+```
+
+-Prediccion en Test:
+
+```{r echo=TRUE}
+predict_rf <- predict(train_fit, df_test_factor, type="prob")[,"class_1"]
+```
+
+El AUC que obtenemos es el siguiente:
+
+```{r echo=TRUE}
+roc_rf = roc(df_test_factor$Churn,as.vector(predict_rf))
+plot(roc_rf,
+     col="darkblue", lwd=3, main="Curve ROC")
+print(ModelMetrics::auc(df_test_factor$Churn,as.vector(predict_rf)))
+auc_df["rf", "auc"] = ModelMetrics::auc(df_test_factor$Churn, as.vector(predict_rf))
+auc_df
+```
+
+
+### Estrategia 8: Red Neuronal
+
+Vamos a usar el paquete *neuralnet* por su simplicidad para resolver nuestro problema usando una red neuronal
+
+```{r echo=TRUE}
+library(neuralnet)
+require(nnet)
+require(ggplot2)
+
+df_train_nn <- df_train
+df_test_nn <- df_test
+df_train_nn$tenure.6 = df_backup_tenure[1:5283]
+df_test_nn$tenure.6 = df_backup_tenure[5284:7043]
+
+# Estadarizamos los predictores en el intervalo de 0 a 1
+scl <- function(x){ (x - min(x))/(max(x) - min(x)) }
+scaled_train <- data.frame(lapply(df_train_nn[, 1:15], scl))
+scaled_test <- data.frame(lapply(df_test_nn[, 1:15], scl))
+
+# Codificamos la variable respuesta con labels mediante la función del paquete nnet class.ind obteniendo dos clases
+scaled_train <- cbind(scaled_train[, 1:15], class.ind(as.factor(df_train_nn$Churn)))
+scaled_test <- cbind(scaled_test[, 1:15], class.ind(as.factor(df_test_nn$Churn)))
+names(scaled_train) <- c(names(scaled_train)[1:15],"class_0","class_1")
+names(scaled_test) <- c(names(scaled_test)[1:15],"class_0","class_1")
+
+# Por las propiedades y la limitación de neuralnet debemos pasar los predictores uno a uno, vamos a automatizarlo de la siguiente forma:
+n <- names(scaled_train)
+f <- as.formula(paste("class_0 + class_1 ~", paste(n[!n %in% c("class_0","class_1")], collapse = " + ")))
+
+#Entrenamos la red
+nn <- neuralnet(f, 
+                data=scaled_train, 
+                hidden=c(3,2), 
+                act.fct = "logistic",
+                err.fct = "sse",
+                linear.output = FALSE,
+                lifesign = "minimal",
+                threshold = 0.1,
+                rep = 1
+                )
+plot(nn)
+ 
+# Predicción en train:
+pr.nn <- compute(nn, scaled_train[, 1:15])
+pr.nn_ <- pr.nn$net.result
+original_values <- max.col(scaled_train[, 16:17])
+pr.nn_2 <- max.col(pr.nn_)
+# Accuracy en train
+mean(pr.nn_2 == original_values)
+
+#Predicción en test:
+pr.nn.test <- compute(nn, scaled_test[, 1:15])
+pr.nn.test_ <- pr.nn.test$net.result
+original_values.test <- max.col(scaled_test[, 16:17])
+pr.nn.test_2 <- max.col(pr.nn.test_)
+# Accuracy en test
+mean(pr.nn.test_2 == original_values.test)
+```
+
+- **Calculamos el AUC**
+
+```{r}
+nn_pred.test=predict(nn, scaled_test, type="prob")[,2]
+auc_nn = ModelMetrics::auc(df_test_factor$Churn,nn_pred.test)
+auc_df["nn","auc"] <-auc_nn
+auc_nn
+```
+
+- **Representamos la curva ROC**
+
+```{r}
+roc_nn = roc(df_test_factor$Churn, nn_pred.test)
+plot(roc_nn,
+     col="darkblue", lwd=3, main="Curve ROC")
+```
+
+
+
+
+## Balanceo muestral
+
+```{r include=FALSE}
+tratamiento <- tratamiento_train_test(df_training, df_testing)
+df_train <- tratamiento$df_train
+df_test <- tratamiento$df_test
+
+tasa_1 <- mean(df_train$Churn)
+```
+Nuestro dataset dispone de un `r tasa_1*100`% de bajas. Balancearemos la muestra para que nuestros algoritmos puedan aprender mejor de las bajas de los clientes. 
+Para ello, igualaremos la tasa de 0's a la de 1's, es decir, bajomuestrearemos al 50%.
+
+```{r echo=TRUE}
+# bajomuestreamos al 50%
+ratio_unos = 0.5
+
+df_unos = df_train %>% filter(Churn== 1)
+df_ceros = df_train %>% filter(Churn== 0)
+
+dim_df_training = nrow(df_unos)/ratio_unos
+dim_0s = dim_df_training - nrow(df_unos)
+sample_0s = dim_0s/nrow(df_ceros)
+
+zeros_under = sample_frac(df_ceros, sample_0s)
+
+df_train = df_unos %>% bind_rows(zeros_under)
+
+mean(df_train$Churn)
+```
+
+Ahora volvemos a aplicar la lgm con lasso:
+
+- **Regresión lineal rebalanceando**
+
+```{r}
+cv.out <- cv.glmnet(x_train, y_train, alpha=1, nfolds=5, type.measure="auc", family="binomial")
+plot(cv.out)
+```
+
+- Valor de lamba con el que entrenaremos: 
+
+```{r echo=TRUE}
+cv.out$lambda.1se
+```
+
+- Coeficientes del Lasso:
+
+```{r echo=TRUE}
+tmp_coeffs <- coef(cv.out, s = "lambda.1se")
+
+tmp_coeffs
+```
+
+- **Predicción en Test**
+
+```{r echo=TRUE}
+lasso.pred=predict(cv.out, newx = x_test, type="response")
+```
+
+- **Curva ROC y métrica AUC en Test**
+
+```{r}
+roc_glm3 = roc(df_test$Churn, lasso.pred)
+plot(roc_glm,
+     col="darkblue", lwd=3, main="Curve ROC")
+auc_df["glm3","auc"] <- ModelMetrics::auc(y_test, lasso.pred)
+auc_df
+```
+
+- **Matriz de confusión**
+```{r}
+lasso_class=predict(cv.out,newx = x_test, type = "class")
+confusionMatrix(table(lasso_class,df_test$Churn), positive="1")
+```
+
+Se observa una ligera mejoría con respecto al anterior mejor resultado.
+
+## Conclusiones
+
+Hemos trabajado sobre un problema clásico de fuga de clientes en una Telco y hemos probado a resolver nuestro problema de predicción con cuatro estrategias. La metrica elegida ha sido AUC que indica cuánto es capaz el modelo de distinguir entre clases. Ha sido una buena métrica para comparar entre distintas estrategias. Las dos estrategias que mejor resultado han dado ha sido la uno y la dos, ambas son variantes de regresión logística.
+
+Otra métrica que pudo ser buena para afinar el modelo elegido hubiera sido recall o sensitividad (así se llama recall en problemas de clasificación binaria). Dicha métrica podría ser una buena opción dado que lo importante en los problemas de fuga de clientes de este tipo podía ser actuar urgentemente con campañas de marketing sobre los clientes que dejan la companía.
+
+```{r}
+auc_df
+```
+
+
+```{r}
+ggroc(list(glm=roc_glm, glm2=roc_glm2, clust=roc_clust, knn= roc_knn, svm=roc_svm, tree=roc_dt, rf=roc_rf, glm3=roc_glm3, nn = roc_nn), aes = c("linetype", "colour")) + 
+  theme_minimal() + 
+  ggtitle("ROC curve for each model") + 
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed")
+```
